@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FPV Robot Proxy</title>
+    <style>
+        html, body { margin: 0; padding: 0; height: 100%; }
+        body { font-family: sans-serif; padding: 10px; box-sizing: border-box; }
+        .app { display: flex; gap: 16px; align-items: stretch; height: calc(100vh - 20px); }
+        .left-panel { flex: 1 1 55%; display: flex; flex-direction: column;
+                      align-items: center; min-width: 0; min-height: 0; }
+        .right-panel { flex: 1 1 45%; display: flex; flex-direction: column;
+                       align-items: center; justify-content: flex-start; overflow-y: auto; }
+        .btn { padding: 10px 16px; margin: 6px; font-size: 15px; touch-action: manipulation; }
+        .status { color: #555; margin: 2px 0; }
+        .battery { font-weight: bold; margin: 6px 0; }
+        .tilt-controls { display: flex; justify-content: center; }
+        #preview { width: 100%; max-width: 340px; aspect-ratio: 4 / 3; background: #000;
+                   display: none; border-radius: 6px; object-fit: cover; }
+        .terminal { width: 100%; max-width: 340px; flex: 1 1 auto; min-height: 60px;
+                    margin-top: 8px; padding: 6px; box-sizing: border-box;
+                    background: #111; color: #0f0; font-family: monospace; font-size: 12px;
+                    text-align: left; overflow-y: auto; border-radius: 6px; white-space: pre-wrap; }
+        .hint { color: #555; font-size: 12px; margin-top: 10px; }
+
+        /* Fall back to a stacked layout when held upright (portrait). */
+        @media (orientation: portrait) {
+            .app { flex-direction: column; height: auto; }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="app">
+        <div class="left-panel">
+            <video id="preview" autoplay playsinline muted></video>
+            <p id="batteryDisplay" class="battery">Battery: ?</p>
+            <pre id="terminal" class="terminal"></pre>
+        </div>
+
+        <div class="right-panel">
+            <h2>FPV Robot Proxy</h2>
+
+            <button id="connectEsp32Btn" class="btn">Connect Robot (ESP32)</button>
+            <p id="esp32Status" class="status">Robot: disconnected</p>
+
+            <button id="connectRemoteBtn" class="btn">Connect FPV Remote</button>
+            <p id="remoteStatus" class="status">Remote: disconnected</p>
+            <p id="remoteControl" class="status">Controls: L 0 / R 0</p>
+
+            <button id="cameraBtn" class="btn">Start Camera</button>
+            <p id="cameraStatus" class="status">Camera: off</p>
+
+            <div class="tilt-controls">
+                <button id="tiltUp" class="btn">Camera ▲</button>
+                <button id="tiltDown" class="btn">Camera ▼</button>
+            </div>
+
+            <p class="hint">Laptop test: hold <b>W</b>/<b>A</b>/<b>S</b>/<b>D</b> to drive (arrows tilt the camera). Release to stop.</p>
+        </div>
+    </div>
+
+    <script>
+        // BLE UUIDs (see README, "BLE interface").
+        const ESP32_SERVICE_UUID  = "4abcdef0-1234-5678-9abc-def012345678";
+        const ESP32_CMD_CHAR_UUID = "4abcdef1-1234-5678-9abc-def012345678";
+        const ESP32_TELEMETRY_CHAR_UUID = "4abcdef2-1234-5678-9abc-def012345678";
+
+        const REMOTE_CONTROL_SERVICE_UUID = "5abcdef0-1234-5678-9abc-def012345678";
+        const REMOTE_CONTROL_STATE_CHAR_UUID = "5abcdef1-1234-5678-9abc-def012345678";
+        const REMOTE_CONTROL_ACK_CHAR_UUID = "5abcdef2-1234-5678-9abc-def012345678";
+        const REMOTE_IMAGE_SERVICE_UUID = "5abcdef3-1234-5678-9abc-def012345678";
+        const REMOTE_IMAGE_HDR_CHAR_UUID = "5abcdef4-1234-5678-9abc-def012345678";
+        const REMOTE_IMAGE_DATA_CHAR_UUID = "5abcdef5-1234-5678-9abc-def012345678";
+
+        // Video streaming parameters:
+        // Scale 2 = 480x312 (18720 B monochrome plane). High speed 1-bit Bayer dithering
+        // with PackBits RLE + XOR delta frames matches the badge e-paper refresh rate (~2 fps).
+        const BADGE_WIDTH = 960;
+        const BADGE_VIEWPORT_HEIGHT = 624;
+        const VIDEO_SCALE = 2; // 480x312
+        const CHUNK_SIZE = 500; // <= MTU - 3
+
+        const FLAG_RLE   = 0x01;
+        const FLAG_DELTA = 0x02;
+        const BAYER_4X4 = [
+            [ 15, 135,  45, 165],
+            [195,  75, 225, 105],
+            [ 60, 180,  30, 150],
+            [240, 120, 210,  90],
+        ];
+
+        let fpvHdrChar = null;
+        let fpvDataChar = null;
+        let fpvNeedKeyframe = true;
+        let prevVideoPlane = null;
+        let nextFrameId = 1;
+        let videoStreamTimer = null;
+        let videoFrameInFlight = false;
+
+        const offscreenCanvas = document.createElement('canvas');
+        offscreenCanvas.width = BADGE_WIDTH / VIDEO_SCALE;   // 480
+        offscreenCanvas.height = BADGE_VIEWPORT_HEIGHT / VIDEO_SCALE; // 312
+        const offscreenCtx = offscreenCanvas.getContext('2d', { willReadFrequently: true });
+
+        function packBitsRleEncode(src) {
+            const dst = new Uint8Array(src.length * 2 + 64);
+            let si = 0, di = 0;
+            const len = src.length;
+            while (si < len) {
+                let run = 1;
+                while (si + run < len && run < 129 && src[si + run] === src[si]) run++;
+                if (run >= 2) {
+                    dst[di++] = 257 - run;
+                    dst[di++] = src[si];
+                    si += run;
+                } else {
+                    const lit = si;
+                    while (si < len && (si - lit) < 128) {
+                        if (si + 2 < len && src[si] === src[si + 1] && src[si] === src[si + 2]) break;
+                        si++;
+                    }
+                    const n = si - lit;
+                    dst[di++] = n - 1;
+                    dst.set(src.subarray(lit, lit + n), di);
+                    di += n;
+                }
+            }
+            return dst.subarray(0, di);
+        }
+
+        async function connectGatt(device, label) {
+            if (device.gatt.connected) {
+                return device.gatt;
+            }
+            log(label + ": connecting GATT...");
+            return await device.gatt.connect();
+        }
+
+        async function connectFpvRemote(device) {
+            const server = await connectGatt(device, 'FPV remote');
+
+            log('FPV remote: getting Control service...');
+            const ctrlService = await server.getPrimaryService(REMOTE_CONTROL_SERVICE_UUID);
+            log('FPV remote: getting Control characteristic...');
+            const characteristic = await ctrlService.getCharacteristic(REMOTE_CONTROL_STATE_CHAR_UUID);
+            characteristic.addEventListener('characteristicvaluechanged', handleRemoteControl);
+
+            // Optional Ack characteristic for Keyframe recovery
+            try {
+                const ackChar = await ctrlService.getCharacteristic(REMOTE_CONTROL_ACK_CHAR_UUID);
+                ackChar.addEventListener('characteristicvaluechanged', (e) => {
+                    const u8 = new Uint8Array(e.target.value.buffer, e.target.value.byteOffset, e.target.value.byteLength);
+                    if (u8.length >= 2 && u8[0] === 0x4B && u8[1] === 0x46) { // 'K', 'F'
+                        fpvNeedKeyframe = true;
+                    }
+                });
+                await ackChar.startNotifications();
+            } catch (err) {
+                console.warn('Control ack char not available:', err);
+            }
+
+            log('FPV remote: subscribing to controls...');
+            await characteristic.startNotifications();
+
+            // Setup Image service for live video stream to badge e-paper
+            try {
+                log('FPV remote: getting Image service...');
+                const imgService = await server.getPrimaryService(REMOTE_IMAGE_SERVICE_UUID);
+                fpvHdrChar = await imgService.getCharacteristic(REMOTE_IMAGE_HDR_CHAR_UUID);
+                fpvDataChar = await imgService.getCharacteristic(REMOTE_IMAGE_DATA_CHAR_UUID);
+                log('FPV remote: video stream channel ready');
+            } catch (err) {
+                console.warn('Image service not available:', err);
+                log('FPV remote: Image service unavailable (' + err.message + ')');
+            }
+
+            return characteristic;
+        }
+
+        let esp32CmdChar = null;
+        let remoteControlChar = null;
+        let remoteDevice = null;
+
+        // Serialised write chain (like index_old.html): overlapping
+        // writeValueWithoutResponse calls fail with "GATT operation already in
+        // progress", which is easy to hit with rapid control notifications.
+        let esp32WriteChain = Promise.resolve();
+
+        function log(message) {
+            const terminal = document.getElementById('terminal');
+            if (!terminal) {
+                return;
+            }
+            terminal.textContent +=
+                '[' + new Date().toLocaleTimeString() + '] ' + message + '\n';
+            // Keep the terminal bounded so it cannot grow without limit.
+            const lines = terminal.textContent.split('\n');
+            if (lines.length > 200) {
+                terminal.textContent = lines.slice(lines.length - 200).join('\n');
+            }
+            terminal.scrollTop = terminal.scrollHeight;
+        }
+
+        function setEsp32Status(text) {
+            document.getElementById('esp32Status').textContent = 'Robot: ' + text;
+            log('Robot: ' + text);
+        }
+        function setRemoteStatus(text) {
+            document.getElementById('remoteStatus').textContent = 'Remote: ' + text;
+            log('Remote: ' + text);
+        }
+
+        ////////////////////////////
+        // ESP32 (movement) link  //
+        ////////////////////////////
+
+        document.getElementById('connectEsp32Btn').addEventListener('click', async () => {
+            try {
+                const device = await navigator.bluetooth.requestDevice({
+                    filters: [
+                        { services: [ESP32_SERVICE_UUID] },
+                        { namePrefix: 'TrackBot' }
+                    ],
+                    optionalServices: [ESP32_SERVICE_UUID]
+                });
+
+                setEsp32Status('connecting...');
+                device.addEventListener('gattserverdisconnected', () => {
+                    esp32CmdChar = null;
+                    setEsp32Status('disconnected');
+                });
+
+                const server = await connectGatt(device, 'Robot');
+                const service = await server.getPrimaryService(ESP32_SERVICE_UUID);
+                esp32CmdChar = await service.getCharacteristic(ESP32_CMD_CHAR_UUID);
+
+                // Telemetry (battery) is optional; ignore if unavailable.
+                try {
+                    const telemetryChar =
+                        await service.getCharacteristic(ESP32_TELEMETRY_CHAR_UUID);
+                    telemetryChar.addEventListener('characteristicvaluechanged', handleTelemetry);
+                    await telemetryChar.startNotifications();
+                } catch (error) {
+                    console.warn('Telemetry unavailable:', error);
+                }
+
+                setEsp32Status('connected (' + (device.name || 'ESP32') + ')');
+
+                // Re-send the latest proxied control state, if we have one.
+                if (lastTank !== null) {
+                    lastMoveCommand = null;
+                    sendMoveCommand(movementFromTank(lastTank.left, lastTank.right));
+                }
+            } catch (error) {
+                console.error('ESP32 connection error:', error);
+                setEsp32Status('error: ' + error.message);
+            }
+        });
+
+        // Sends a single movement command byte ('F'/'B'/'L'/'R'/'S') to the ESP32.
+        function sendMoveCommand(commandChar) {
+            if (!esp32CmdChar) {
+                return Promise.resolve();
+            }
+            esp32WriteChain = esp32WriteChain.then(async () => {
+                if (!esp32CmdChar) {
+                    return;
+                }
+                try {
+                    await esp32CmdChar.writeValueWithoutResponse(
+                        new TextEncoder().encode(commandChar));
+                } catch (error) {
+                    console.error('BLE write error:', error);
+                }
+            });
+            return esp32WriteChain;
+        }
+
+        function handleTelemetry(event) {
+            const text = new TextDecoder('utf-8').decode(event.target.value);
+            let batteryPct = null;
+            if (text.startsWith('BAT:')) {
+                batteryPct = text.slice(4);
+            } else if (text.startsWith('{')) {
+                // The ESP32 currently sends JSON, e.g. {"bat":85,"dist":12}.
+                try {
+                    const data = JSON.parse(text);
+                    if (typeof data.bat === 'number') {
+                        batteryPct = data.bat;
+                    }
+                } catch (error) {
+                    // Not valid JSON; leave batteryPct unset.
+                }
+            }
+            if (batteryPct !== null) {
+                document.getElementById('batteryDisplay').textContent =
+                    'Battery: ' + batteryPct + '%';
+            }
+            log(text);
+        }
+
+        ///////////////////////////
+        // FPV remote (control)  //
+        ///////////////////////////
+
+        let lastTank = null;
+        let lastMoveCommand = null;
+        const CONTROL_DEADZONE = 20;
+
+        document.getElementById('connectRemoteBtn').addEventListener('click', async () => {
+            const btn = document.getElementById('connectRemoteBtn');
+            if (remoteDevice && remoteDevice.gatt.connected) {
+                remoteDevice.gatt.disconnect();
+                return;
+            }
+
+            let step = 'choosing the device';
+            try {
+                btn.disabled = true;
+                const device = await navigator.bluetooth.requestDevice({
+                    filters: [
+                        { services: [REMOTE_CONTROL_SERVICE_UUID] },
+                        { name: 'TrackBot-FPV' },
+                        { namePrefix: 'TrackBot' }
+                    ],
+                    optionalServices: [REMOTE_CONTROL_SERVICE_UUID, REMOTE_IMAGE_SERVICE_UUID]
+                });
+
+                remoteDevice = device;
+                setRemoteStatus('connecting...');
+                device.addEventListener('gattserverdisconnected', () => {
+                    remoteControlChar = null;
+                    fpvHdrChar = null;
+                    fpvDataChar = null;
+                    prevVideoPlane = null;
+                    stopVideoStream();
+                    btn.textContent = 'Connect FPV Remote';
+                    btn.disabled = false;
+                    lastTank = null;
+                    lastMoveCommand = null;
+                    sendMoveCommand('S');
+                    setRemoteStatus('disconnected');
+                });
+
+                step = 'opening the link and subscribing';
+                remoteControlChar = await connectFpvRemote(device);
+
+                btn.textContent = 'Disconnect Remote';
+                btn.disabled = false;
+                setRemoteStatus('connected (' + (device.name || 'FPV Remote') + ')');
+
+                if (cameraStream) {
+                    startVideoStream();
+                }
+            } catch (error) {
+                btn.disabled = false;
+                console.error('FPV remote connection error while ' + step + ':', error);
+                setRemoteStatus('error while ' + step + ': ' + error.message);
+            }
+        });
+
+        // Control-state layout (see README): int8 left_track, int8 right_track,
+        // uint8 buttons, uint8 seq. We proxy the two track throttles onto the
+        // ESP32's discrete movement protocol.
+        function handleRemoteControl(event) {
+            const view = event.target.value;
+            if (view.byteLength < 2) {
+                return;
+            }
+            const left = view.getInt8(0);
+            const right = view.getInt8(1);
+            lastTank = { left: left, right: right };
+            document.getElementById('remoteControl').textContent =
+                'Controls: L ' + left + ' / R ' + right;
+
+            const move = movementFromTank(left, right);
+            if (move !== lastMoveCommand) {
+                lastMoveCommand = move;
+                sendMoveCommand(move);
+            }
+        }
+
+        // Reduces (left, right) track throttle to a discrete movement command.
+        // Left-forward/right-back turns right (positive steer); the average
+        // throttle drives forward/back. A deadzone yields 'S' (stop).
+        function movementFromTank(left, right) {
+            const throttle = (left + right) / 2;
+            const steer = (left - right) / 2;  // positive = turn right
+            if (Math.abs(steer) > CONTROL_DEADZONE &&
+                Math.abs(steer) >= Math.abs(throttle)) {
+                return steer > 0 ? 'R' : 'L';
+            }
+            if (Math.abs(throttle) > CONTROL_DEADZONE) {
+                return throttle > 0 ? 'F' : 'B';
+            }
+            return 'S';
+        }
+
+        //////////////
+        // Camera   //
+        //////////////
+
+        let cameraStream = null;
+
+        function startVideoStream() {
+            if (videoStreamTimer) clearInterval(videoStreamTimer);
+            log('Starting video stream to badge...');
+            prevVideoPlane = null;
+            fpvNeedKeyframe = true;
+            videoStreamTimer = setInterval(sendVideoFrame, 500); // 2 fps matches e-paper refresh rate
+        }
+
+        function stopVideoStream() {
+            if (videoStreamTimer) {
+                clearInterval(videoStreamTimer);
+                videoStreamTimer = null;
+                log('Stopped video stream to badge');
+            }
+        }
+
+        async function sendVideoFrame() {
+            if (videoFrameInFlight || !fpvHdrChar || !fpvDataChar || !cameraStream) return;
+            const video = document.getElementById('preview');
+            if (!video || video.readyState < 2) return;
+
+            videoFrameInFlight = true;
+            try {
+                const dw = offscreenCanvas.width;   // 480
+                const dh = offscreenCanvas.height;  // 312
+                const planeLen = (dw * dh) >> 3;    // 18720 B
+
+                // Draw and center-crop video to 20:13 aspect ratio
+                const vw = video.videoWidth || dw;
+                const vh = video.videoHeight || dh;
+                const targetAspect = dw / dh;
+                let sx = 0, sy = 0, sw = vw, sh = vh;
+                if (vw / vh > targetAspect) {
+                    sw = Math.round(vh * targetAspect);
+                    sx = Math.round((vw - sw) / 2);
+                } else {
+                    sh = Math.round(vw / targetAspect);
+                    sy = Math.round((vh - sh) / 2);
+                }
+
+                offscreenCtx.drawImage(video, sx, sy, sw, sh, 0, 0, dw, dh);
+                const rgba = offscreenCtx.getImageData(0, 0, dw, dh).data;
+                const currPlane = new Uint8Array(planeLen);
+
+                // 4x4 Bayer dithering into 1-bit monochrome plane
+                for (let y = 0; y < dh; y++) {
+                    const brow = BAYER_4X4[y & 3];
+                    for (let x = 0; x < dw; x++) {
+                        const idx = y * dw + x;
+                        const p = idx * 4;
+                        const luma = (77 * rgba[p] + 150 * rgba[p + 1] + 29 * rgba[p + 2]) >> 8;
+                        if (luma < brow[x & 3]) {
+                            currPlane[idx >> 3] |= 0x80 >> (idx & 7); // 1 = dark ink
+                        }
+                    }
+                }
+
+                const forceKf = fpvNeedKeyframe || !prevVideoPlane || (nextFrameId % 15 === 0);
+                const rleFull = packBitsRleEncode(currPlane);
+                let payload = rleFull.length < planeLen ? rleFull : currPlane;
+                let flags = rleFull.length < planeLen ? FLAG_RLE : 0;
+
+                if (!forceKf) {
+                    const deltaPlane = new Uint8Array(planeLen);
+                    for (let i = 0; i < planeLen; i++) deltaPlane[i] = currPlane[i] ^ prevVideoPlane[i];
+                    const rleDelta = packBitsRleEncode(deltaPlane);
+                    if (rleDelta.length < payload.length * 0.85) {
+                        payload = rleDelta;
+                        flags = FLAG_RLE | FLAG_DELTA;
+                    }
+                }
+
+                prevVideoPlane = currPlane;
+                fpvNeedKeyframe = false;
+
+                const frameId = nextFrameId++ & 0xFFFF;
+                const hdr = new ArrayBuffer(8);
+                const dv = new DataView(hdr);
+                dv.setUint16(0, frameId, true);
+                dv.setUint32(2, payload.byteLength, true);
+                dv.setUint8(6, VIDEO_SCALE);
+                dv.setUint8(7, flags);
+
+                await fpvHdrChar.writeValueWithoutResponse(hdr);
+                for (let offset = 0; offset < payload.byteLength; offset += CHUNK_SIZE) {
+                    const chunk = payload.subarray(offset, offset + CHUNK_SIZE);
+                    await fpvDataChar.writeValueWithoutResponse(chunk);
+                }
+            } catch (err) {
+                console.warn('Video frame send error:', err);
+            } finally {
+                videoFrameInFlight = false;
+            }
+        }
+
+        document.getElementById('cameraBtn').addEventListener('click', async () => {
+            const video = document.getElementById('preview');
+            const status = document.getElementById('cameraStatus');
+            const button = document.getElementById('cameraBtn');
+
+            if (cameraStream) {
+                cameraStream.getTracks().forEach((track) => track.stop());
+                cameraStream = null;
+                stopVideoStream();
+                video.srcObject = null;
+                video.style.display = 'none';
+                button.textContent = 'Start Camera';
+                status.textContent = 'Camera: off';
+                return;
+            }
+
+            try {
+                cameraStream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'user' },
+                    audio: false
+                });
+                video.srcObject = cameraStream;
+                video.style.display = 'block';
+                button.textContent = 'Stop Camera';
+                status.textContent = 'Camera: on';
+                if (fpvHdrChar && fpvDataChar) {
+                    startVideoStream();
+                }
+            } catch (error) {
+                console.error('Camera error:', error);
+                status.textContent = 'Camera: error (' + error.message + ')';
+            }
+        });
+
+        /////////////////////
+        // WASD (laptop)   //
+        /////////////////////
+
+        const KEY_COMMANDS = { w: 'F', a: 'L', s: 'B', d: 'R' };
+        const STOP_COMMAND = 'S';
+        const heldKeys = [];
+
+        function isTypingTarget(target) {
+            if (!target) {
+                return false;
+            }
+            const tag = target.tagName;
+            return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable;
+        }
+
+        function driveKeyCommand(commandChar) {
+            if (!esp32CmdChar) {
+                return;
+            }
+            sendMoveCommand(commandChar);
+        }
+
+        function releaseAllKeys() {
+            if (heldKeys.length === 0) {
+                return;
+            }
+            heldKeys.length = 0;
+            driveKeyCommand(STOP_COMMAND);
+        }
+
+        document.addEventListener('keydown', (event) => {
+            if (event.ctrlKey || event.metaKey || event.altKey || isTypingTarget(event.target)) {
+                return;
+            }
+            const key = event.key.toLowerCase();
+            if (!(key in KEY_COMMANDS)) {
+                return;
+            }
+            event.preventDefault();
+            if (event.repeat) {
+                return;
+            }
+            const existingIndex = heldKeys.indexOf(key);
+            if (existingIndex !== -1) {
+                heldKeys.splice(existingIndex, 1);
+            }
+            heldKeys.push(key);
+            driveKeyCommand(KEY_COMMANDS[key]);
+        });
+
+        document.addEventListener('keyup', (event) => {
+            const key = event.key.toLowerCase();
+            if (!(key in KEY_COMMANDS)) {
+                return;
+            }
+            event.preventDefault();
+            const index = heldKeys.indexOf(key);
+            if (index === -1) {
+                return;
+            }
+            heldKeys.splice(index, 1);
+            if (heldKeys.length === 0) {
+                driveKeyCommand(STOP_COMMAND);
+            } else {
+                driveKeyCommand(KEY_COMMANDS[heldKeys[heldKeys.length - 1]]);
+            }
+        });
+
+        window.addEventListener('blur', releaseAllKeys);
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                releaseAllKeys();
+            }
+        });
+
+        ///////////////////
+        // Camera tilt   //
+        ///////////////////
+
+        const TILT_KEY_COMMANDS = { arrowup: 'U', arrowdown: 'D' };
+
+        document.addEventListener('keydown', (event) => {
+            if (event.ctrlKey || event.metaKey || event.altKey || isTypingTarget(event.target)) {
+                return;
+            }
+            const tiltCommand = TILT_KEY_COMMANDS[event.key.toLowerCase()];
+            if (!tiltCommand) {
+                return;
+            }
+            event.preventDefault();
+            driveKeyCommand(tiltCommand);
+        });
+
+        function bindTiltButton(button, commandChar) {
+            if (!button) {
+                return;
+            }
+            let repeatTimer = null;
+            const stopRepeat = () => {
+                if (repeatTimer !== null) {
+                    clearInterval(repeatTimer);
+                    repeatTimer = null;
+                }
+            };
+            button.addEventListener('pointerdown', (event) => {
+                event.preventDefault();
+                driveKeyCommand(commandChar);
+                stopRepeat();
+                repeatTimer = setInterval(() => driveKeyCommand(commandChar), 120);
+            });
+            button.addEventListener('pointerup', stopRepeat);
+            button.addEventListener('pointerleave', stopRepeat);
+            button.addEventListener('pointercancel', stopRepeat);
+        }
+
+        bindTiltButton(document.getElementById('tiltUp'), 'U');
+        bindTiltButton(document.getElementById('tiltDown'), 'D');
+
+        log('FPV proxy ready - waiting for devices');
+    </script>
+</body>
+</html>
